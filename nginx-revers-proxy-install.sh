@@ -25,10 +25,25 @@ print_status() {
     esac
 }
 
+# Function to show welcome message and warning
+show_welcome() {
+    echo "=============================================="
+    echo "   NGINX Reverse Proxy Configuration Wizard   "
+    echo "=============================================="
+    echo ""
+    
+    print_status "warning" "IMPORTANT: Before continuing, make sure you have:"
+    echo "1. Created an A record in your DNS for your domain pointing to this server's IP"
+    echo "2. Allowed time for DNS propagation (can take up to 24 hours)"
+    echo ""
+    read -p "Press Enter to continue once your DNS is configured..." 
+    echo ""
+}
+
 # Function to check if running as root
 check_root() {
     if [[ $EUID -ne 0 ]]; then
-        print_status "error" "This script must be run as root"
+        print_status "error" "This script must be run as root. Please use: sudo $0"
         exit 1
     fi
 }
@@ -55,7 +70,7 @@ check_dependencies() {
 
 # Function to install dependencies
 install_dependencies() {
-    print_status "info" "Installing dependencies..."
+    print_status "info" "Installing required packages..."
     
     # Detect package manager
     if command -v apt &> /dev/null; then
@@ -82,14 +97,14 @@ install_dependencies() {
         fi
         
     else
-        print_status "error" "Unsupported package manager"
+        print_status "error" "Unsupported package manager. Please install NGINX manually first."
         exit 1
     fi
     
     if [[ $? -eq 0 ]]; then
-        print_status "success" "Dependencies installed successfully"
+        print_status "success" "Packages installed successfully"
     else
-        print_status "error" "Failed to install dependencies"
+        print_status "error" "Failed to install required packages"
         exit 1
     fi
 }
@@ -102,29 +117,33 @@ get_user_input() {
     echo ""
     
     # Get backend server details
-    read -p "Enter the backend server IP address: " BACKEND_IP
-    read -p "Enter the backend server port: " BACKEND_PORT
+    read -p "Enter the backend server IP address (the server you want to proxy to): " BACKEND_IP
+    read -p "Enter the backend server port (e.g., 3000, 8080, etc.): " BACKEND_PORT
     
     # Get domain name
-    read -p "Enter the domain name for the reverse proxy (e.g., example.com): " DOMAIN_NAME
+    read -p "Enter your domain name (e.g., example.com): " DOMAIN_NAME
     
     # SSL configuration
     read -p "Enable HTTPS/SSL? (yes/no) [yes]: " ENABLE_SSL
     ENABLE_SSL=${ENABLE_SSL:-yes}
     
     if [[ "$ENABLE_SSL" == "yes" ]]; then
-        read -p "Enter email for SSL certificate (for renewal notices): " SSL_EMAIL
+        read -p "Enter your email for SSL certificate (for renewal notices): " SSL_EMAIL
+        read -p "Force HTTPS redirect? (yes/no) [yes]: " FORCE_HTTPS
+        FORCE_HTTPS=${FORCE_HTTPS:-yes}
     fi
     
-    # Additional options
-    read -p "Enable WebSocket support? (yes/no) [yes]: " WEBSOCKET_SUPPORT
-    WEBSOCKET_SUPPORT=${WEBSOCKET_SUPPORT:-yes}
+    # Additional options with default "no"
+    echo ""
+    echo "Advanced options (if you don't know what these are, just press Enter for default):"
+    read -p "Enable WebSocket support? (yes/no) [no]: " WEBSOCKET_SUPPORT
+    WEBSOCKET_SUPPORT=${WEBSOCKET_SUPPORT:-no}
     
-    read -p "Enable Gzip compression? (yes/no) [yes]: " GZIP_COMPRESSION
-    GZIP_COMPRESSION=${GZIP_COMPRESSION:-yes}
+    read -p "Enable Gzip compression? (yes/no) [no]: " GZIP_COMPRESSION
+    GZIP_COMPRESSION=${GZIP_COMPRESSION:-no}
     
-    read -p "Enable access logging? (yes/no) [yes]: " ACCESS_LOGGING
-    ACCESS_LOGGING=${ACCESS_LOGGING:-yes}
+    read -p "Enable detailed access logging? (yes/no) [no]: " ACCESS_LOGGING
+    ACCESS_LOGGING=${ACCESS_LOGGING:-no}
     
     echo ""
 }
@@ -132,17 +151,17 @@ get_user_input() {
 # Function to validate input
 validate_input() {
     if [[ -z "$BACKEND_IP" || -z "$BACKEND_PORT" || -z "$DOMAIN_NAME" ]]; then
-        print_status "error" "All fields are required"
+        print_status "error" "Error: All fields are required. Please provide all information."
         return 1
     fi
     
     if ! [[ "$BACKEND_PORT" =~ ^[0-9]+$ ]] || [ "$BACKEND_PORT" -lt 1 ] || [ "$BACKEND_PORT" -gt 65535 ]; then
-        print_status "error" "Port must be a number between 1 and 65535"
+        print_status "error" "Error: Port must be a valid number between 1 and 65535"
         return 1
     fi
     
     if [[ "$ENABLE_SSL" == "yes" && -z "$SSL_EMAIL" ]]; then
-        print_status "error" "Email is required for SSL certificate"
+        print_status "error" "Error: Email address is required for SSL certificate registration"
         return 1
     fi
     
@@ -155,15 +174,15 @@ add_websocket_support() {
     
     # Check if the map block already exists
     if ! grep -q "connection_upgrade" "$main_config"; then
-        print_status "info" "Adding WebSocket support to main NGINX configuration..."
+        print_status "info" "Configuring WebSocket support..."
         
         # Add the map block before the http block
         sed -i '/http {/i \# WebSocket support\nmap \$http_upgrade \$connection_upgrade {\n    default upgrade;\n    '\'''\''      close;\n}\n' "$main_config"
         
         if [[ $? -eq 0 ]]; then
-            print_status "success" "WebSocket support added to main configuration"
+            print_status "success" "WebSocket support configured successfully"
         else
-            print_status "warning" "Could not automatically add WebSocket support. You may need to manually add it."
+            print_status "warning" "Could not automatically configure WebSocket support. You may need to add it manually to nginx.conf"
         fi
     fi
 }
@@ -183,7 +202,7 @@ create_nginx_config() {
         add_websocket_support
     fi
     
-    print_status "info" "Creating NGINX configuration..."
+    print_status "info" "Creating reverse proxy configuration..."
     
     # Create the configuration file
     cat > "$config_file" << EOF
@@ -194,46 +213,52 @@ server {
     listen 80;
     server_name $DOMAIN_NAME;
     
-    # Access logging
-    $(if [[ "$ACCESS_LOGGING" == "yes" ]]; then
-        echo "access_log /var/log/nginx/${DOMAIN_NAME}_access.log;"
-        echo "error_log /var/log/nginx/${DOMAIN_NAME}_error.log;"
+    $(if [[ "$ENABLE_SSL" == "yes" && "$FORCE_HTTPS" == "yes" ]]; then
+        echo "    # Redirect HTTP to HTTPS"
+        echo "    return 301 https://\$host\$request_uri;"
     else
-        echo "access_log off;"
-        echo "error_log /var/log/nginx/${DOMAIN_NAME}_error.log;"
-    fi)
-    
-    # Security headers
-    add_header X-Frame-Options DENY always;
-    add_header X-Content-Type-Options nosniff always;
-    add_header X-XSS-Protection "1; mode=block" always;
-    
-    # Proxy settings
-    location / {
-        proxy_pass http://$BACKEND_IP:$BACKEND_PORT;
-        proxy_http_version 1.1;
-        $(if [[ "$WEBSOCKET_SUPPORT" == "yes" ]]; then
-            echo "proxy_set_header Upgrade \$http_upgrade;"
-            echo "proxy_set_header Connection \"upgrade\";"
+        echo "    # Access logging"
+        if [[ "$ACCESS_LOGGING" == "yes" ]]; then
+            echo "    access_log /var/log/nginx/${DOMAIN_NAME}_access.log;"
+            echo "    error_log /var/log/nginx/${DOMAIN_NAME}_error.log;"
         else
-            echo "# proxy_set_header Upgrade \$http_upgrade;"
-            echo "# proxy_set_header Connection \"upgrade\";"
-        fi)
-        proxy_set_header Host \$host;
-        proxy_set_header X-Real-IP \$remote_addr;
-        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto \$scheme;
+            echo "    access_log off;"
+            echo "    error_log /var/log/nginx/${DOMAIN_NAME}_error.log;"
+        fi
         
-        # Timeout settings
-        proxy_connect_timeout 60s;
-        proxy_send_timeout 60s;
-        proxy_read_timeout 60s;
-        
-        # Buffer settings
-        proxy_buffering on;
-        proxy_buffer_size 4k;
-        proxy_buffers 8 4k;
-    }
+        echo ""
+        echo "    # Security headers"
+        echo "    add_header X-Frame-Options DENY always;"
+        echo "    add_header X-Content-Type-Options nosniff always;"
+        echo "    add_header X-XSS-Protection \"1; mode=block\" always;"
+        echo ""
+        echo "    # Proxy settings"
+        echo "    location / {"
+        echo "        proxy_pass http://$BACKEND_IP:$BACKEND_PORT;"
+        echo "        proxy_http_version 1.1;"
+        if [[ "$WEBSOCKET_SUPPORT" == "yes" ]]; then
+            echo "        proxy_set_header Upgrade \$http_upgrade;"
+            echo "        proxy_set_header Connection \"upgrade\";"
+        else
+            echo "        # proxy_set_header Upgrade \$http_upgrade;"
+            echo "        # proxy_set_header Connection \"upgrade\";"
+        fi
+        echo "        proxy_set_header Host \$host;"
+        echo "        proxy_set_header X-Real-IP \$remote_addr;"
+        echo "        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;"
+        echo "        proxy_set_header X-Forwarded-Proto \$scheme;"
+        echo ""
+        echo "        # Timeout settings"
+        echo "        proxy_connect_timeout 60s;"
+        echo "        proxy_send_timeout 60s;"
+        echo "        proxy_read_timeout 60s;"
+        echo ""
+        echo "        # Buffer settings"
+        echo "        proxy_buffering on;"
+        echo "        proxy_buffer_size 4k;"
+        echo "        proxy_buffers 8 4k;"
+        echo "    }"
+    fi)
     
     # Block common vulnerabilities
     location ~* /\.env {
@@ -276,11 +301,11 @@ server {
     
     # Access logging
     $(if [[ "$ACCESS_LOGGING" == "yes" ]]; then
-        echo "access_log /var/log/nginx/${DOMAIN_NAME}_ssl_access.log;"
-        echo "error_log /var/log/nginx/${DOMAIN_NAME}_ssl_error.log;"
+        echo "    access_log /var/log/nginx/${DOMAIN_NAME}_ssl_access.log;"
+        echo "    error_log /var/log/nginx/${DOMAIN_NAME}_ssl_error.log;"
     else
-        echo "access_log off;"
-        echo "error_log /var/log/nginx/${DOMAIN_NAME}_ssl_error.log;"
+        echo "    access_log off;"
+        echo "    error_log /var/log/nginx/${DOMAIN_NAME}_ssl_error.log;"
     fi)
     
     # Proxy settings
@@ -288,11 +313,11 @@ server {
         proxy_pass http://$BACKEND_IP:$BACKEND_PORT;
         proxy_http_version 1.1;
         $(if [[ "$WEBSOCKET_SUPPORT" == "yes" ]]; then
-            echo "proxy_set_header Upgrade \$http_upgrade;"
-            echo "proxy_set_header Connection \"upgrade\";"
+            echo "        proxy_set_header Upgrade \$http_upgrade;"
+            echo "        proxy_set_header Connection \"upgrade\";"
         else
-            echo "# proxy_set_header Upgrade \$http_upgrade;"
-            echo "# proxy_set_header Connection \"upgrade\";"
+            echo "        # proxy_set_header Upgrade \$http_upgrade;"
+            echo "        # proxy_set_header Connection \"upgrade\";"
         fi)
         proxy_set_header Host \$host;
         proxy_set_header X-Real-IP \$remote_addr;
@@ -314,7 +339,7 @@ SSL_EOF
     fi
     ln -s "$config_file" "/etc/nginx/sites-enabled/$DOMAIN_NAME"
     
-    print_status "success" "NGINX configuration created"
+    print_status "success" "Configuration file created successfully"
 }
 
 # Function to obtain SSL certificate
@@ -323,7 +348,7 @@ obtain_ssl_certificate() {
         return 0
     fi
     
-    print_status "info" "Obtaining SSL certificate from Let's Encrypt..."
+    print_status "info" "Requesting SSL certificate from Let's Encrypt..."
     
     # Use --webroot method instead of stopping NGINX
     if certbot certonly --webroot --non-interactive --agree-tos \
@@ -333,18 +358,18 @@ obtain_ssl_certificate() {
         
         # Setup automatic renewal
         (crontab -l 2>/dev/null; echo "0 12 * * * /usr/bin/certbot renew --quiet") | crontab -
-        print_status "info" "SSL certificate auto-renewal configured"
+        print_status "info" "Automatic certificate renewal has been configured"
     else
         print_status "error" "Failed to obtain SSL certificate"
-        print_status "warning" "Continuing without SSL. You can manually obtain certificate later with:"
-        print_status "info" "certbot certonly --nginx -d $DOMAIN_NAME"
+        print_status "warning" "Continuing without SSL. You can manually obtain a certificate later with:"
+        print_status "info" "sudo certbot --nginx -d $DOMAIN_NAME"
         ENABLE_SSL="no"
     fi
 }
 
 # Function to configure firewall
 configure_firewall() {
-    print_status "info" "Configuring firewall..."
+    print_status "info" "Configuring firewall rules..."
     
     # Check if ufw is available
     if command -v ufw &> /dev/null; then
@@ -363,10 +388,10 @@ configure_firewall() {
         firewall-cmd --reload >> "$LOG_FILE" 2>&1
         
     else
-        print_status "warning" "No supported firewall manager found. Please manually open ports:"
-        print_status "info" "Port 80 (HTTP) needs to be open"
+        print_status "warning" "No supported firewall manager found. Please ensure these ports are open:"
+        print_status "info" "Port 80 (HTTP) must be open"
         if [[ "$ENABLE_SSL" == "yes" ]]; then
-            print_status "info" "Port 443 (HTTPS) needs to be open"
+            print_status "info" "Port 443 (HTTPS) must be open"
         fi
         return 1
     fi
@@ -376,26 +401,26 @@ configure_firewall() {
 
 # Function to test NGINX configuration
 test_nginx_config() {
-    print_status "info" "Testing NGINX configuration..."
+    print_status "info" "Testing configuration for errors..."
     
     if nginx -t >> "$LOG_FILE" 2>&1; then
-        print_status "success" "NGINX configuration test passed"
+        print_status "success" "Configuration test passed"
         return 0
     else
-        print_status "error" "NGINX configuration test failed. Check $LOG_FILE for details."
+        print_status "error" "Configuration test failed. Please check the log file: $LOG_FILE"
         return 1
     fi
 }
 
 # Function to restart NGINX
 restart_nginx() {
-    print_status "info" "Restarting NGINX..."
+    print_status "info" "Applying configuration changes..."
     
     if systemctl restart nginx >> "$LOG_FILE" 2>&1; then
         print_status "success" "NGINX restarted successfully"
         return 0
     else
-        print_status "error" "Failed to restart NGINX"
+        print_status "error" "Failed to restart NGINX. Check system status with: systemctl status nginx"
         return 1
     fi
 }
@@ -407,38 +432,47 @@ display_summary() {
     echo "           INSTALLATION COMPLETE              "
     echo "=============================================="
     echo ""
-    echo "Reverse Proxy Configuration Summary:"
-    echo "------------------------------------"
+    echo "Your reverse proxy has been successfully configured!"
+    echo ""
+    echo "Configuration Summary:"
+    echo "----------------------"
     echo "Backend Server: $BACKEND_IP:$BACKEND_PORT"
     echo "Domain Name: $DOMAIN_NAME"
-    echo "HTTPS/SSL: $ENABLE_SSL"
-    echo "WebSocket Support: $WEBSOCKET_SUPPORT"
-    echo "Gzip Compression: $GZIP_COMPRESSION"
+    echo "HTTPS/SSL: $( [[ "$ENABLE_SSL" == "yes" ]] && echo "Enabled" || echo "Disabled" )"
+    if [[ "$ENABLE_SSL" == "yes" ]]; then
+        echo "Force HTTPS: $( [[ "$FORCE_HTTPS" == "yes" ]] && echo "Enabled" || echo "Disabled" )"
+    fi
+    echo "WebSocket Support: $( [[ "$WEBSOCKET_SUPPORT" == "yes" ]] && echo "Enabled" || echo "Disabled" )"
+    echo "Access Logging: $( [[ "$ACCESS_LOGGING" == "yes" ]] && echo "Enabled" || echo "Disabled" )"
     echo ""
     echo "Next Steps:"
     echo "-----------"
-    echo "1. Ensure your domain $DOMAIN_NAME points to this server's IP"
+    echo "1. Ensure your DNS A record for $DOMAIN_NAME points to this server's IP"
+    echo "2. Allow up to 24 hours for DNS propagation if you just created the record"
     
     if [[ "$ENABLE_SSL" != "yes" ]]; then
-        echo "2. To enable SSL later, run: certbot --nginx -d $DOMAIN_NAME"
+        echo "3. Enable SSL later with: sudo certbot --nginx -d $DOMAIN_NAME"
     fi
     
-    echo "3. Check logs: /var/log/nginx/${DOMAIN_NAME}_*.log"
-    echo "4. Configuration file: /etc/nginx/sites-available/$DOMAIN_NAME"
+    echo "4. Check logs: /var/log/nginx/${DOMAIN_NAME}_*.log"
+    echo "5. Configuration file: /etc/nginx/sites-available/$DOMAIN_NAME"
     echo ""
     echo "Test your setup by visiting:"
     if [[ "$ENABLE_SSL" == "yes" ]]; then
-        echo "HTTPS: https://$DOMAIN_NAME"
+        echo "Secure: https://$DOMAIN_NAME"
     else
-        echo "HTTP: http://$DOMAIN_NAME"
+        echo "Regular: http://$DOMAIN_NAME"
     fi
     echo ""
-    echo "Log file: $LOG_FILE"
+    echo "Need help? Check the log file: $LOG_FILE"
     echo "=============================================="
 }
 
 # Main execution
 main() {
+    # Show welcome message and warning first
+    show_welcome
+    
     check_root
     
     # Initialize log file
@@ -450,7 +484,7 @@ main() {
     
     # Validate input
     if ! validate_input; then
-        print_status "error" "Input validation failed. Please run the script again."
+        print_status "error" "Please fix the errors above and run the script again."
         exit 1
     fi
     
@@ -470,13 +504,13 @@ main() {
     
     # Test configuration
     if ! test_nginx_config; then
-        print_status "error" "Configuration test failed. Aborting."
+        print_status "error" "Configuration test failed. Please check the errors above."
         exit 1
     fi
     
     # Restart NGINX
     if ! restart_nginx; then
-        print_status "error" "Failed to restart NGINX. Check logs for details."
+        print_status "error" "Failed to restart NGINX. Please check the system logs."
         exit 1
     fi
     
