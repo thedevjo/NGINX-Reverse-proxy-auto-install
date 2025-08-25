@@ -25,6 +25,37 @@ print_status() {
     esac
 }
 
+# Function to validate yes/no input
+validate_yes_no() {
+    local input="$1"
+    local default="$2"
+    
+    # Convert to lowercase for comparison
+    input_lower=$(echo "$input" | tr '[:upper:]' '[:lower:]')
+    
+    if [[ -z "$input" && -n "$default" ]]; then
+        echo "$default"
+        return 0
+    fi
+    
+    case "$input_lower" in
+        "yes"|"y") echo "yes"; return 0 ;;
+        "no"|"n") echo "no"; return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+# Function to validate email format
+validate_email() {
+    local email="$1"
+    # Simple email validation regex
+    if [[ "$email" =~ ^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$ ]]; then
+        return 0
+    else
+        return 1
+    fi
+}
+
 # Function to show welcome message and warning
 show_welcome() {
     echo "=============================================="
@@ -117,33 +148,104 @@ get_user_input() {
     echo ""
     
     # Get backend server details
-    read -p "Enter the backend server IP address (the server you want to proxy to): " BACKEND_IP
-    read -p "Enter the backend server port (e.g., 3000, 8080, etc.): " BACKEND_PORT
+    while true; do
+        read -p "Enter the backend server IP address (the server you want to proxy to): " BACKEND_IP
+        if [[ -n "$BACKEND_IP" ]]; then
+            break
+        else
+            print_status "error" "Backend server IP is required. Please try again."
+        fi
+    done
+    
+    while true; do
+        read -p "Enter the backend server port (e.g., 3000, 8080, etc.): " BACKEND_PORT
+        if [[ "$BACKEND_PORT" =~ ^[0-9]+$ ]] && [ "$BACKEND_PORT" -ge 1 ] && [ "$BACKEND_PORT" -le 65535 ]; then
+            break
+        else
+            print_status "error" "Port must be a valid number between 1 and 65535. Please try again."
+        fi
+    done
     
     # Get domain name
-    read -p "Enter your domain name (e.g., example.com): " DOMAIN_NAME
+    while true; do
+        read -p "Enter your domain name (e.g., example.com): " DOMAIN_NAME
+        if [[ -n "$DOMAIN_NAME" ]]; then
+            break
+        else
+            print_status "error" "Domain name is required. Please try again."
+        fi
+    done
     
     # SSL configuration
-    read -p "Enable HTTPS/SSL? (yes/no) [yes]: " ENABLE_SSL
-    ENABLE_SSL=${ENABLE_SSL:-yes}
+    while true; do
+        read -p "Enable HTTPS/SSL? (yes/no) [yes]: " SSL_INPUT
+        ENABLE_SSL=$(validate_yes_no "$SSL_INPUT" "yes")
+        if [[ $? -eq 0 ]]; then
+            break
+        else
+            print_status "error" "Please enter 'yes' or 'no'. Please try again."
+        fi
+    done
     
     if [[ "$ENABLE_SSL" == "yes" ]]; then
-        read -p "Enter your email for SSL certificate (for renewal notices): " SSL_EMAIL
-        read -p "Force HTTPS redirect? (yes/no) [yes]: " FORCE_HTTPS
-        FORCE_HTTPS=${FORCE_HTTPS:-yes}
+        # Email validation with retry
+        while true; do
+            read -p "Enter your email for SSL certificate (for renewal notices): " SSL_EMAIL
+            if validate_email "$SSL_EMAIL"; then
+                break
+            else
+                print_status "error" "Invalid email format. Please enter a valid email address."
+            fi
+        done
+        
+        # Force HTTPS validation
+        while true; do
+            read -p "Force HTTPS redirect? (yes/no) [yes]: " HTTPS_INPUT
+            FORCE_HTTPS=$(validate_yes_no "$HTTPS_INPUT" "yes")
+            if [[ $? -eq 0 ]]; then
+                break
+            else
+                print_status "error" "Please enter 'yes' or 'no'. Please try again."
+            fi
+        done
     fi
     
     # Additional options with default "no"
     echo ""
     echo "Advanced options (if you don't know what these are, just press Enter for default):"
-    read -p "Enable WebSocket support? (yes/no) [no]: " WEBSOCKET_SUPPORT
-    WEBSOCKET_SUPPORT=${WEBSOCKET_SUPPORT:-no}
     
-    read -p "Enable Gzip compression? (yes/no) [no]: " GZIP_COMPRESSION
-    GZIP_COMPRESSION=${GZIP_COMPRESSION:-no}
+    # WebSocket support validation
+    while true; do
+        read -p "Enable WebSocket support? (yes/no) [no]: " WS_INPUT
+        WEBSOCKET_SUPPORT=$(validate_yes_no "$WS_INPUT" "no")
+        if [[ $? -eq 0 ]]; then
+            break
+        else
+            print_status "error" "Please enter 'yes' or 'no'. Please try again."
+        fi
+    done
     
-    read -p "Enable detailed access logging? (yes/no) [no]: " ACCESS_LOGGING
-    ACCESS_LOGGING=${ACCESS_LOGGING:-no}
+    # Gzip compression validation
+    while true; do
+        read -p "Enable Gzip compression? (yes/no) [no]: " GZIP_INPUT
+        GZIP_COMPRESSION=$(validate_yes_no "$GZIP_INPUT" "no")
+        if [[ $? -eq 0 ]]; then
+            break
+        else
+            print_status "error" "Please enter 'yes' or 'no'. Please try again."
+        fi
+    done
+    
+    # Access logging validation
+    while true; do
+        read -p "Enable detailed access logging? (yes/no) [no]: " LOG_INPUT
+        ACCESS_LOGGING=$(validate_yes_no "$LOG_INPUT" "no")
+        if [[ $? -eq 0 ]]; then
+            break
+        else
+            print_status "error" "Please enter 'yes' or 'no'. Please try again."
+        fi
+    done
     
     echo ""
 }
