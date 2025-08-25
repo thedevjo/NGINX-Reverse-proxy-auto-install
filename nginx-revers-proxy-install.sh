@@ -56,6 +56,105 @@ validate_email() {
     fi
 }
 
+# Function to extract IP from URL
+extract_ip() {
+    local input="$1"
+    # Remove http://, https://, and everything after : or /
+    echo "$input" | sed -e 's|^[^/]*//||' -e 's|[:/].*$||' -e 's|^.*@||'
+}
+
+# Function to extract port from URL
+extract_port() {
+    local input="$1"
+    # Extract port number if present
+    if echo "$input" | grep -q ':'; then
+        echo "$input" | sed 's/^.*://' | sed 's/[^0-9].*$//'
+    else
+        echo "$input"
+    fi
+}
+
+# Function to show main menu
+show_menu() {
+    echo "=============================================="
+    echo "       NGINX Reverse Proxy Manager           "
+    echo "=============================================="
+    echo ""
+    echo "1. Install Reverse Proxy"
+    echo "2. Remove Reverse Proxy"
+    echo "3. Exit"
+    echo ""
+    read -p "Select an option (1-3): " MENU_CHOICE
+}
+
+# Function to remove reverse proxy
+remove_reverse_proxy() {
+    echo ""
+    echo "=============================================="
+    echo "        Remove Reverse Proxy Configuration    "
+    echo "=============================================="
+    echo ""
+    
+    # List available sites
+    if [[ ! -d "/etc/nginx/sites-available" ]]; then
+        print_status "info" "No reverse proxy configurations found."
+        return
+    fi
+    
+    local sites=($(ls /etc/nginx/sites-available/ 2>/dev/null))
+    if [[ ${#sites[@]} -eq 0 ]]; then
+        print_status "info" "No reverse proxy configurations found."
+        return
+    fi
+    
+    echo "Available configurations:"
+    for i in "${!sites[@]}"; do
+        echo "$((i+1)). ${sites[$i]}"
+    done
+    echo ""
+    
+    read -p "Enter the number of the configuration to remove: " REMOVE_CHOICE
+    
+    if [[ ! "$REMOVE_CHOICE" =~ ^[0-9]+$ ]] || [ "$REMOVE_CHOICE" -lt 1 ] || [ "$REMOVE_CHOICE" -gt ${#sites[@]} ]; then
+        print_status "error" "Invalid selection."
+        return
+    fi
+    
+    local selected_site="${sites[$((REMOVE_CHOICE-1))]}"
+    
+    # Confirm removal
+    read -p "Are you sure you want to remove '$selected_site'? (yes/no): " CONFIRM_REMOVE
+    if [[ ! "$CONFIRM_REMOVE" =~ ^[Yy][Ee][Ss]|[Yy]$ ]]; then
+        print_status "info" "Removal cancelled."
+        return
+    fi
+    
+    # Remove configuration
+    print_status "info" "Removing configuration for $selected_site..."
+    
+    # Remove from sites-enabled
+    if [[ -f "/etc/nginx/sites-enabled/$selected_site" ]]; then
+        rm -f "/etc/nginx/sites-enabled/$selected_site"
+    fi
+    
+    # Remove from sites-available
+    if [[ -f "/etc/nginx/sites-available/$selected_site" ]]; then
+        rm -f "/etc/nginx/sites-available/$selected_site"
+    fi
+    
+    # Test configuration
+    if nginx -t >> "$LOG_FILE" 2>&1; then
+        # Restart NGINX
+        if systemctl restart nginx >> "$LOG_FILE" 2>&1; then
+            print_status "success" "Reverse proxy configuration for '$selected_site' removed successfully."
+        else
+            print_status "error" "Failed to restart NGINX. Configuration was removed but NGINX needs manual restart."
+        fi
+    else
+        print_status "error" "Configuration test failed after removal. Please check NGINX configuration manually."
+    fi
+}
+
 # Function to show welcome message and warning
 show_welcome() {
     echo "=============================================="
@@ -149,20 +248,32 @@ get_user_input() {
     
     # Get backend server details
     while true; do
-        read -p "Enter the backend server IP address (the server you want to proxy to): " BACKEND_IP
-        if [[ -n "$BACKEND_IP" ]]; then
-            break
+        read -p "Enter the backend server IP address (the server you want to proxy to): " BACKEND_IP_INPUT
+        if [[ -n "$BACKEND_IP_INPUT" ]]; then
+            # Extract just the IP address
+            BACKEND_IP=$(extract_ip "$BACKEND_IP_INPUT")
+            if [[ -n "$BACKEND_IP" ]]; then
+                break
+            else
+                print_status "error" "Could not extract valid IP address. Please try again."
+            fi
         else
             print_status "error" "Backend server IP is required. Please try again."
         fi
     done
     
     while true; do
-        read -p "Enter the backend server port (e.g., 3000, 8080, etc.): " BACKEND_PORT
-        if [[ "$BACKEND_PORT" =~ ^[0-9]+$ ]] && [ "$BACKEND_PORT" -ge 1 ] && [ "$BACKEND_PORT" -le 65535 ]; then
-            break
+        read -p "Enter the backend server port (e.g., 3000, 8080, etc.): " BACKEND_PORT_INPUT
+        if [[ -n "$BACKEND_PORT_INPUT" ]]; then
+            # Extract just the port number
+            BACKEND_PORT=$(extract_port "$BACKEND_PORT_INPUT")
+            if [[ "$BACKEND_PORT" =~ ^[0-9]+$ ]] && [ "$BACKEND_PORT" -ge 1 ] && [ "$BACKEND_PORT" -le 65535 ]; then
+                break
+            else
+                print_status "error" "Port must be a valid number between 1 and 65535. Please try again."
+            fi
         else
-            print_status "error" "Port must be a valid number between 1 and 65535. Please try again."
+            print_status "error" "Backend server port is required. Please try again."
         fi
     done
     
@@ -514,15 +625,36 @@ test_nginx_config() {
     fi
 }
 
-# Function to restart NGINX
-restart_nginx() {
+# Function to restart NGINX safely (with fallback)
+restart_nginx_safely() {
     print_status "info" "Applying configuration changes..."
     
+    # Test configuration first
+    if ! nginx -t >> "$LOG_FILE" 2>&1; then
+        print_status "error" "Configuration test failed. Cannot restart NGINX."
+        return 1
+    fi
+    
+    # Try to restart NGINX
     if systemctl restart nginx >> "$LOG_FILE" 2>&1; then
         print_status "success" "NGINX restarted successfully"
         return 0
     else
-        print_status "error" "Failed to restart NGINX. Check system status with: systemctl status nginx"
+        print_status "error" "Failed to restart NGINX. Attempting to revert changes..."
+        
+        # Remove the problematic configuration
+        if [[ -f "/etc/nginx/sites-enabled/$DOMAIN_NAME" ]]; then
+            rm -f "/etc/nginx/sites-enabled/$DOMAIN_NAME"
+        fi
+        
+        # Try to restart with clean configuration
+        if systemctl restart nginx >> "$LOG_FILE" 2>&1; then
+            print_status "warning" "NGINX restarted after removing problematic configuration. Please check your settings."
+        else
+            print_status "error" "Critical: NGINX failed to restart even after reverting changes. Manual intervention required."
+            print_status "info" "Check system status with: systemctl status nginx"
+            print_status "info" "Check logs with: journalctl -xe"
+        fi
         return 1
     fi
 }
@@ -570,12 +702,10 @@ display_summary() {
     echo "=============================================="
 }
 
-# Main execution
-main() {
+# Function to install reverse proxy
+install_reverse_proxy() {
     # Show welcome message and warning first
     show_welcome
-    
-    check_root
     
     # Initialize log file
     > "$LOG_FILE"
@@ -587,7 +717,7 @@ main() {
     # Validate input
     if ! validate_input; then
         print_status "error" "Please fix the errors above and run the script again."
-        exit 1
+        return 1
     fi
     
     # Check and install dependencies
@@ -607,23 +737,56 @@ main() {
     # Test configuration
     if ! test_nginx_config; then
         print_status "error" "Configuration test failed. Please check the errors above."
-        exit 1
+        return 1
     fi
     
-    # Restart NGINX
-    if ! restart_nginx; then
+    # Restart NGINX safely
+    if ! restart_nginx_safely; then
         print_status "error" "Failed to restart NGINX. Please check the system logs."
-        exit 1
+        return 1
     fi
     
     # Display summary
     display_summary
     
     log_message "Installation completed successfully"
+    return 0
+}
+
+# Main execution
+main() {
+    check_root
+    
+    while true; do
+        show_menu
+        
+        case $MENU_CHOICE in
+            1)
+                if install_reverse_proxy; then
+                    read -p "Press Enter to continue..."
+                else
+                    print_status "error" "Installation failed. Check $LOG_FILE for details."
+                    read -p "Press Enter to continue..."
+                fi
+                ;;
+            2)
+                remove_reverse_proxy
+                read -p "Press Enter to continue..."
+                ;;
+            3)
+                echo "Goodbye!"
+                exit 0
+                ;;
+            *)
+                print_status "error" "Invalid option. Please try again."
+                sleep 2
+                ;;
+        esac
+    done
 }
 
 # Handle script interruption
-trap 'echo -e "\n${RED}Installation interrupted by user${NC}"; exit 1' INT
+trap 'echo -e "\n${RED}Operation interrupted by user${NC}"; exit 1' INT
 
 # Run main function
 main "$@"
