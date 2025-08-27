@@ -497,11 +497,11 @@ obtain_ssl_certificate() {
     
     print_status "info" "Requesting SSL certificate from Let's Encrypt..."
     
-    # Use --webroot method instead of stopping NGINX
+    # First try the webroot method
     if certbot certonly --webroot --non-interactive --agree-tos \
         --email "$SSL_EMAIL" -d "$DOMAIN_NAME" \
         --webroot-path="/var/www/html" >> "$LOG_FILE" 2>&1; then
-        print_status "success" "SSL certificate obtained successfully"
+        print_status "success" "SSL certificate obtained successfully using webroot method"
         
         # Setup automatic renewal
         (crontab -l 2>/dev/null; echo "0 12 * * * /usr/bin/certbot renew --quiet") | crontab -
@@ -509,11 +509,93 @@ obtain_ssl_certificate() {
         
         # Now add HTTPS configuration
         add_https_configuration
+        return 0
     else
-        print_status "error" "Failed to obtain SSL certificate"
-        print_status "warning" "Continuing without SSL. You can manually obtain a certificate later with:"
-        print_status "info" "sudo certbot --nginx -d $DOMAIN_NAME"
-        ENABLE_SSL="no"
+        print_status "warning" "Webroot method failed, trying nginx method..."
+        
+        # If webroot method fails, try the nginx method
+        # Create a backup of the config file first
+        cp "/etc/nginx/sites-available/$DOMAIN_NAME" "/etc/nginx/sites-available/$DOMAIN_NAME.backup"
+        
+        if certbot --nginx --non-interactive --agree-tos \
+            --email "$SSL_EMAIL" -d "$DOMAIN_NAME" >> "$LOG_FILE" 2>&1; then
+            print_status "success" "SSL certificate obtained successfully using nginx method"
+            
+            # Setup automatic renewal
+            (crontab -l 2>/dev/null; echo "0 12 * * * /usr/bin/certbot renew --quiet") | crontab -
+            print_status "info" "Automatic certificate renewal has been configured"
+            
+            # The nginx method automatically configures HTTPS, so we need to restore our proxy settings
+            restore_proxy_settings_after_certbot
+            return 0
+        else
+            print_status "error" "Failed to obtain SSL certificate using both methods"
+            print_status "warning" "Continuing without SSL. You can manually obtain a certificate later with:"
+            print_status "info" "sudo certbot --nginx -d $DOMAIN_NAME"
+            ENABLE_SSL="no"
+            return 1
+        fi
+    fi
+}
+
+# Function to restore proxy settings after Certbot modifies the config
+restore_proxy_settings_after_certbot() {
+    local config_file="/etc/nginx/sites-available/$DOMAIN_NAME"
+    local temp_file="/tmp/nginx_temp_config"
+    
+    print_status "info" "Restoring proxy settings after Certbot modification..."
+    
+    # Create a temporary file with our original proxy settings
+    cat > "$temp_file" << EOF
+        # Proxy settings
+        proxy_pass http://$BACKEND_IP:$BACKEND_PORT;
+        proxy_http_version 1.1;
+        $(if [[ "$WEBSOCKET_SUPPORT" == "yes" ]]; then
+            echo "        proxy_set_header Upgrade \$http_upgrade;"
+            echo "        proxy_set_header Connection \"upgrade\";"
+        else
+            echo "        # proxy_set_header Upgrade \$http_upgrade;"
+            echo "        # proxy_set_header Connection \"upgrade\";"
+        fi)
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+        
+        # Timeout settings
+        proxy_connect_timeout 60s;
+        proxy_send_timeout 60s;
+        proxy_read_timeout 60s;
+        
+        # Buffer settings
+        proxy_buffering on;
+        proxy_buffer_size 4k;
+        proxy_buffers 8 4k;
+EOF
+
+    # Replace the location block content with our proxy settings
+    # This is a bit complex but necessary because Certbot modifies the config
+    sed -i '/location \/ {/,/}/ {
+        /location \/ {/ {
+            n
+            r /tmp/nginx_temp_config
+            d
+        }
+        /}/!d
+    }' "$config_file"
+    
+    # Clean up
+    rm -f "$temp_file"
+    
+    # Test and reload configuration
+    if nginx -t >> "$LOG_FILE" 2>&1; then
+        systemctl reload nginx >> "$LOG_FILE" 2>&1
+        print_status "success" "Proxy settings restored and NGINX reloaded successfully"
+    else
+        print_status "error" "Configuration test failed after restoring proxy settings"
+        print_status "warning" "Restoring from backup configuration..."
+        cp "/etc/nginx/sites-available/$DOMAIN_NAME.backup" "$config_file"
+        systemctl reload nginx >> "$LOG_FILE" 2>&1
     fi
 }
 
@@ -584,7 +666,9 @@ SSL_EOF
     # Add HTTPS redirect if enabled
     if [[ "$FORCE_HTTPS" == "yes" ]]; then
         # Add redirect to the HTTP server block
-        sed -i '/server_name $DOMAIN_NAME;/a \ \n    # Redirect HTTP to HTTPS\n    return 301 https://$host$request_uri;' "$config_file"
+        sed -i "/server_name $DOMAIN_NAME;/a \\
+    # Redirect HTTP to HTTPS\\
+    return 301 https://\\\$host\\\$request_uri;" "$config_file"
     fi
     
     print_status "success" "HTTPS configuration added successfully"
