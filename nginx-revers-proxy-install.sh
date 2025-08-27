@@ -417,7 +417,7 @@ create_nginx_config() {
     
     print_status "info" "Creating reverse proxy configuration..."
     
-    # Create the configuration file
+    # Create the configuration file with only HTTP block
     cat > "$config_file" << EOF
 # Reverse Proxy Configuration for $DOMAIN_NAME
 # Generated on $(date)
@@ -426,52 +426,46 @@ server {
     listen 80;
     server_name $DOMAIN_NAME;
     
-    $(if [[ "$ENABLE_SSL" == "yes" && "$FORCE_HTTPS" == "yes" ]]; then
-        echo "    # Redirect HTTP to HTTPS"
-        echo "    return 301 https://\$host\$request_uri;"
+    # Access logging
+    $(if [[ "$ACCESS_LOGGING" == "yes" ]]; then
+        echo "    access_log /var/log/nginx/${DOMAIN_NAME}_access.log;"
+        echo "    error_log /var/log/nginx/${DOMAIN_NAME}_error.log;"
     else
-        echo "    # Access logging"
-        if [[ "$ACCESS_LOGGING" == "yes" ]]; then
-            echo "    access_log /var/log/nginx/${DOMAIN_NAME}_access.log;"
-            echo "    error_log /var/log/nginx/${DOMAIN_NAME}_error.log;"
-        else
-            echo "    access_log off;"
-            echo "    error_log /var/log/nginx/${DOMAIN_NAME}_error.log;"
-        fi
-        
-        echo ""
-        echo "    # Security headers"
-        echo "    add_header X-Frame-Options DENY always;"
-        echo "    add_header X-Content-Type-Options nosniff always;"
-        echo "    add_header X-XSS-Protection \"1; mode=block\" always;"
-        echo ""
-        echo "    # Proxy settings"
-        echo "    location / {"
-        echo "        proxy_pass http://$BACKEND_IP:$BACKEND_PORT;"
-        echo "        proxy_http_version 1.1;"
-        if [[ "$WEBSOCKET_SUPPORT" == "yes" ]]; then
+        echo "    access_log off;"
+        echo "    error_log /var/log/nginx/${DOMAIN_NAME}_error.log;"
+    fi)
+    
+    # Security headers
+    add_header X-Frame-Options DENY always;
+    add_header X-Content-Type-Options nosniff always;
+    add_header X-XSS-Protection "1; mode=block" always;
+    
+    # Proxy settings
+    location / {
+        proxy_pass http://$BACKEND_IP:$BACKEND_PORT;
+        proxy_http_version 1.1;
+        $(if [[ "$WEBSOCKET_SUPPORT" == "yes" ]]; then
             echo "        proxy_set_header Upgrade \$http_upgrade;"
             echo "        proxy_set_header Connection \"upgrade\";"
         else
             echo "        # proxy_set_header Upgrade \$http_upgrade;"
             echo "        # proxy_set_header Connection \"upgrade\";"
-        fi
-        echo "        proxy_set_header Host \$host;"
-        echo "        proxy_set_header X-Real-IP \$remote_addr;"
-        echo "        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;"
-        echo "        proxy_set_header X-Forwarded-Proto \$scheme;"
-        echo ""
-        echo "        # Timeout settings"
-        echo "        proxy_connect_timeout 60s;"
-        echo "        proxy_send_timeout 60s;"
-        echo "        proxy_read_timeout 60s;"
-        echo ""
-        echo "        # Buffer settings"
-        echo "        proxy_buffering on;"
-        echo "        proxy_buffer_size 4k;"
-        echo "        proxy_buffers 8 4k;"
-        echo "    }"
-    fi)
+        fi)
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+        
+        # Timeout settings
+        proxy_connect_timeout 60s;
+        proxy_send_timeout 60s;
+        proxy_read_timeout 60s;
+        
+        # Buffer settings
+        proxy_buffering on;
+        proxy_buffer_size 4k;
+        proxy_buffers 8 4k;
+    }
     
     # Block common vulnerabilities
     location ~* /\.env {
@@ -486,9 +480,51 @@ server {
 }
 EOF
 
-    # Add SSL section if enabled
-    if [[ "$ENABLE_SSL" == "yes" ]]; then
-        cat >> "$config_file" << SSL_EOF
+    # Enable the site
+    if [[ -f "/etc/nginx/sites-enabled/$DOMAIN_NAME" ]]; then
+        rm "/etc/nginx/sites-enabled/$DOMAIN_NAME"
+    fi
+    ln -s "$config_file" "/etc/nginx/sites-enabled/$DOMAIN_NAME"
+    
+    print_status "success" "Configuration file created successfully"
+}
+
+# Function to obtain SSL certificate
+obtain_ssl_certificate() {
+    if [[ "$ENABLE_SSL" != "yes" ]]; then
+        return 0
+    fi
+    
+    print_status "info" "Requesting SSL certificate from Let's Encrypt..."
+    
+    # Use --webroot method instead of stopping NGINX
+    if certbot certonly --webroot --non-interactive --agree-tos \
+        --email "$SSL_EMAIL" -d "$DOMAIN_NAME" \
+        --webroot-path="/var/www/html" >> "$LOG_FILE" 2>&1; then
+        print_status "success" "SSL certificate obtained successfully"
+        
+        # Setup automatic renewal
+        (crontab -l 2>/dev/null; echo "0 12 * * * /usr/bin/certbot renew --quiet") | crontab -
+        print_status "info" "Automatic certificate renewal has been configured"
+        
+        # Now add HTTPS configuration
+        add_https_configuration
+    else
+        print_status "error" "Failed to obtain SSL certificate"
+        print_status "warning" "Continuing without SSL. You can manually obtain a certificate later with:"
+        print_status "info" "sudo certbot --nginx -d $DOMAIN_NAME"
+        ENABLE_SSL="no"
+    fi
+}
+
+# Function to add HTTPS configuration after certificate is obtained
+add_https_configuration() {
+    local config_file="/etc/nginx/sites-available/$DOMAIN_NAME"
+    
+    print_status "info" "Adding HTTPS configuration..."
+    
+    # Append HTTPS configuration to the existing file
+    cat >> "$config_file" << SSL_EOF
 
 # HTTPS Server
 server {
@@ -544,39 +580,21 @@ server {
     }
 }
 SSL_EOF
-    fi
 
-    # Enable the site
-    if [[ -f "/etc/nginx/sites-enabled/$DOMAIN_NAME" ]]; then
-        rm "/etc/nginx/sites-enabled/$DOMAIN_NAME"
-    fi
-    ln -s "$config_file" "/etc/nginx/sites-enabled/$DOMAIN_NAME"
-    
-    print_status "success" "Configuration file created successfully"
-}
-
-# Function to obtain SSL certificate
-obtain_ssl_certificate() {
-    if [[ "$ENABLE_SSL" != "yes" ]]; then
-        return 0
+    # Add HTTPS redirect if enabled
+    if [[ "$FORCE_HTTPS" == "yes" ]]; then
+        # Add redirect to the HTTP server block
+        sed -i '/server_name $DOMAIN_NAME;/a \ \n    # Redirect HTTP to HTTPS\n    return 301 https://$host$request_uri;' "$config_file"
     fi
     
-    print_status "info" "Requesting SSL certificate from Let's Encrypt..."
+    print_status "success" "HTTPS configuration added successfully"
     
-    # Use --webroot method instead of stopping NGINX
-    if certbot certonly --webroot --non-interactive --agree-tos \
-        --email "$SSL_EMAIL" -d "$DOMAIN_NAME" \
-        --webroot-path="/var/www/html" >> "$LOG_FILE" 2>&1; then
-        print_status "success" "SSL certificate obtained successfully"
-        
-        # Setup automatic renewal
-        (crontab -l 2>/dev/null; echo "0 12 * * * /usr/bin/certbot renew --quiet") | crontab -
-        print_status "info" "Automatic certificate renewal has been configured"
+    # Test and reload configuration
+    if nginx -t >> "$LOG_FILE" 2>&1; then
+        systemctl reload nginx >> "$LOG_FILE" 2>&1
+        print_status "success" "NGINX configuration reloaded with HTTPS"
     else
-        print_status "error" "Failed to obtain SSL certificate"
-        print_status "warning" "Continuing without SSL. You can manually obtain a certificate later with:"
-        print_status "info" "sudo certbot --nginx -d $DOMAIN_NAME"
-        ENABLE_SSL="no"
+        print_status "error" "HTTPS configuration test failed. Please check the configuration manually."
     fi
 }
 
@@ -725,14 +743,11 @@ install_reverse_proxy() {
         install_dependencies
     fi
     
-    # Create NGINX configuration
+    # Create NGINX configuration (HTTP only initially)
     create_nginx_config
     
     # Configure firewall
     configure_firewall
-    
-    # Obtain SSL certificate if enabled
-    obtain_ssl_certificate
     
     # Test configuration
     if ! test_nginx_config; then
@@ -744,6 +759,11 @@ install_reverse_proxy() {
     if ! restart_nginx_safely; then
         print_status "error" "Failed to restart NGINX. Please check the system logs."
         return 1
+    fi
+    
+    # Obtain SSL certificate if enabled (this will add HTTPS config later)
+    if [[ "$ENABLE_SSL" == "yes" ]]; then
+        obtain_ssl_certificate
     fi
     
     # Display summary
